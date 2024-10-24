@@ -1,7 +1,7 @@
 import cv2
 import numpy as np
 from time import sleep, time
-
+from sklearn.linear_model import LinearRegression
 # Parameters
 largura_min = 80  # Minimum rectangle width for vehicle detection
 altura_min = 80   # Minimum rectangle height for vehicle detection
@@ -9,7 +9,36 @@ offset = 6        # Offset for line crossing detection
 pos_linha = 550   # Line position for vehicle counting
 delay = 60        # Video frame delay (for simulation)
 speed_estimation_interval = 5  # Interval to estimate speed (in frames)
+model = LinearRegression()
 
+# Example historical data (you can collect more as the code runs)
+# X: Time intervals (in frames), Y: Vehicle counts
+X_train = np.array([1, 2, 3, 4, 5]).reshape(-1, 1)  # Replace with actual historical intervals
+y_train = np.array([10, 15, 18, 20, 22])  # Replace with actual historical counts
+
+
+def generate_heatmap(frame, detec):
+    """Generate a heatmap showing traffic density."""
+    heatmap = np.zeros((frame.shape[0], frame.shape[1]), dtype=np.uint8)
+
+    # Increment pixel values where vehicles are detected
+    for (x, y) in detec:
+        cv2.circle(heatmap, (x, y), 20, (255), -1)  # Adjust radius for heatmap spread
+
+    # Apply color map to the heatmap
+    heatmap_colored = cv2.applyColorMap(heatmap, cv2.COLORMAP_JET)
+
+    # Blend the original frame with the heatmap
+    blended_frame = cv2.addWeighted(frame, 0.7, heatmap_colored, 0.3, 0)
+    return blended_frame
+
+# Train the model (update with new data over time)
+model.fit(X_train, y_train)
+
+def predict_vehicle_flow(current_frame_count):
+    """Predict vehicle count for future frames."""
+    prediction = model.predict(np.array([[current_frame_count + 1]]))
+    return int(prediction[0])
 # Detection lists and counters
 detec_cam1 = []
 detec_cam2 = []
@@ -216,18 +245,26 @@ def classify_lane(x):
 def process_frame(frame, detec, carros, pos_linha, vehicle_speeds, frame_count, emergency_detected):
     global vehicle_counts  # Declare vehicle_counts as global if defined outside
     adjusted_speed = 0.0
+
+    # Heatmap generation
+    heatmap_frame = generate_heatmap(frame, detec)
+
     grey = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
     blur = cv2.GaussianBlur(grey, (3, 3), 5)
     img_sub = subtracao.apply(blur)
     dilat = cv2.dilate(img_sub, np.ones((5, 5)))
     kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
     dilatada = cv2.morphologyEx(dilat, cv2.MORPH_CLOSE, kernel)
-    dilatada = cv2.morphologyEx(dilatada, cv2.MORPH_CLOSE, kernel)
 
     contorno, h = cv2.findContours(dilatada, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
-    cv2.line(frame, (25, pos_linha), (1200, pos_linha), (176, 130, 39), 2)
+    cv2.line(heatmap_frame, (25, pos_linha), (1200, pos_linha), (176, 130, 39), 2)
 
     frame_height, frame_width, _ = frame.shape
+
+    # Prediction based on current frame count
+    predicted_count = predict_vehicle_flow(carros)
+    cv2.putText(heatmap_frame, f"Predicted Count: {predicted_count}", (50, 150),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2)
 
     for (i, c) in enumerate(contorno):
         (x, y, w, h) = cv2.boundingRect(c)
@@ -236,17 +273,16 @@ def process_frame(frame, detec, carros, pos_linha, vehicle_speeds, frame_count, 
             continue
 
         # Detect vehicle color and type
-        vehicle_color = detect_vehicle_color(frame[y:y+h, x:x+w])
+        vehicle_color = detect_vehicle_color(frame[y:y + h, x:x + w])
 
         # Draw text for vehicle type and color
-        cv2.putText(frame, vehicle_color, (x, y - 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
-        
+        cv2.putText(heatmap_frame, vehicle_color, (x, y - 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
 
         # Draw rectangle and find center
-        cv2.rectangle(frame, (x, y), (x + w, y + h), (0, 255, 0), 2)
+        cv2.rectangle(heatmap_frame, (x, y), (x + w, y + h), (0, 255, 0), 2)
         centro = get_center(x, y, w, h)
         detec.append(centro)
-        cv2.circle(frame, centro, 4, (0, 0, 255), -1)
+        cv2.circle(heatmap_frame, centro, 4, (0, 0, 255), -1)
 
         # Vehicle speed estimation (every 5 frames)
         if len(detec) > 1 and frame_count % speed_estimation_interval == 0:
@@ -258,49 +294,41 @@ def process_frame(frame, detec, carros, pos_linha, vehicle_speeds, frame_count, 
         # Check if the vehicle crosses the counting line
         if len(detec) > 1 and frame_count % speed_estimation_interval == 0:
             lane_index = classify_lane(centro[0])
-            
-            # Use the last detected vehicle's position to check crossing
+
             if previous_y < pos_linha <= centro[1]:  # Vehicle crosses the line downwards
                 lane_counts[lane_index] += 1
                 lane_speeds[lane_index].append(adjusted_speed)
+                log_file.write(f"Lane: {lane_index + 1}, Color: {vehicle_color}, "
+                               f"Speed: {adjusted_speed:.2f}, Count: {lane_counts[lane_index]}\n")
 
-                # Log lane, vehicle type, color, speed, and count
-                log_file.write(f"Lane: {lane_index + 1}, Color: {vehicle_color}, Speed: {adjusted_speed:.2f}, Count: {lane_counts[lane_index]}\n")
-
-    frame_width = frame.shape[1]
-    margin_right = 10  # Adjust this value to move text closer or further from the right edge
-
-    cv2.putText(frame, f"Cars: {vehicle_counts.get('Car', 0)}", (frame_width - 150, 50), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
-    cv2.putText(frame, f"Trucks: {vehicle_counts.get('Truck', 0)}", (frame_width - 150, 70), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
-    cv2.putText(frame, f"Bikes: {vehicle_counts.get('Bike', 0)}", (frame_width - 150, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
-
-    # Detect emergency vehicle
-    if detect_emergency_vehicle(frame):
-        emergency_detected = True
-        log_file.write("Emergency vehicle detected!\n")
-
-    # Calculate traffic density
     density = calculate_traffic_density(carros_cam1, carros_cam2)
-    cv2.putText(frame, f"Traffic Density: {density:.2f}%", (50, 200), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
+    cv2.putText(heatmap_frame, f"Traffic Density: {density:.2f}%", (50, 200),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
 
-    # Check for vehicles crossing the line
     for (x, y) in detec:
         if (y < (pos_linha + offset)) and (y > (pos_linha - offset)):
             vehicle_type = classify_vehicle(w, h)  
             print(f"Detected vehicle type: {vehicle_type}")
 
-        # Increment vehicle count based on type
+            # Increment vehicle count based on type
             if vehicle_type in vehicle_counts:
                 vehicle_counts[vehicle_type] += 1
 
             cv2.putText(frame, vehicle_type, (x, y - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
-                
+
             carros += 1
             cv2.line(frame, (25, pos_linha), (1200, pos_linha), (0, 127, 255), 3)
-            detec.remove((x, y))
+            detec.remove((x, y))  # Remove the detected vehicle from the list
             print(f"Car detected. Current count: {carros}")
 
-    return frame, carros, vehicle_speeds, emergency_detected
+    # Display vehicle counts
+    cv2.putText(frame, f"Cars: {vehicle_counts.get('Car', 0)}", (frame_width - 150, 50), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+    cv2.putText(frame, f"Trucks: {vehicle_counts.get('Truck', 0)}", (frame_width - 150, 70), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+    cv2.putText(frame, f"Bikes: {vehicle_counts.get('Bike', 0)}", (frame_width - 150, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+
+    return heatmap_frame, carros, vehicle_speeds, emergency_detected
+
+
 
 
 
@@ -352,7 +380,16 @@ while True:
     cv2.putText(frame2, f"CAM2 COUNT: {carros_cam2}", (50, 70), cv2.FONT_HERSHEY_COMPLEX, 2, (0, 0, 255), 4)
     cv2.putText(frame1, f"TRAFFIC STATUS: {traffic_status}", (50, 150), cv2.FONT_HERSHEY_COMPLEX, 2, (255, 0, 0), 4)
     cv2.putText(frame1, f"FPS: {fps:.2f}", (50, 200), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 0), 2)
+    frame_height, frame_width, _ = frame1.shape
+    cv2.putText(frame1, f"Cars: {vehicle_counts.get('Car', 0)}", (frame_width - 150, 50), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+    cv2.putText(frame1, f"Trucks: {vehicle_counts.get('Truck', 0)}", (frame_width - 150, 70), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+    cv2.putText(frame1, f"Bikes: {vehicle_counts.get('Bike', 0)}", (frame_width - 150, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
     
+
+    frame_height, frame_width, _ = frame2.shape
+    cv2.putText(frame2, f"Cars: {vehicle_counts.get('Car', 0)}", (frame_width - 150, 50), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+    cv2.putText(frame2, f"Trucks: {vehicle_counts.get('Truck', 0)}", (frame_width - 150, 70), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+    cv2.putText(frame2, f"Bikes: {vehicle_counts.get('Bike', 0)}", (frame_width - 150, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
     # Display frames
     cv2.imshow("Camera 1", frame1)
     cv2.imshow("Camera 2", frame2)
